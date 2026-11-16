@@ -16,8 +16,7 @@ def render_text(request: Request, analyses: list[dict]) -> str:
     blocks = [f"分析对象：{request.feature}", "状态：可修改的初稿，需由项目安全团队复核"]
     for section in analyses:
         task = section["task"]
-        blocks.extend(["", f"## {task}", "关键假设："])
-        blocks.extend(f"- {item}" for item in section["assumptions"])
+        blocks.extend(["", f"## {task}"])
         for row in section["rows"]:
             blocks.append("")
             blocks.append(f"[{row['编号']}]")
@@ -70,7 +69,6 @@ def main(argv: list[str] | None = None) -> int:
                 task = section["task"]
                 fields = FIELDS[task]
                 sheets.append((task, fields, [[row[field] for field in fields] for row in section["rows"]]))
-            sheets.append(("说明与假设", ["任务", "关键假设"], [[section["task"], item] for section in analyses for item in section["assumptions"]]))
             write_xlsx(path, sheets)
             print(f"已生成：{path.resolve()}")
         else:

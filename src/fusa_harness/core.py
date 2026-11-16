@@ -16,7 +16,11 @@ from zipfile import ZipFile
 
 
 FIELDS = {
-    "HARA": ["编号", "功能", "运行场景", "车辆级失效行为", "危害", "危险事件", "S", "E", "C", "ASIL", "安全目标"],
+    "HARA": [
+        "Hazard", "编号", "位置", "道路条件", "环境条件", "本车车速", "本车操作", "相关项工作状态",
+        "Potential Effect", "Severity", "Severity Comment", "Exposure", "Exposure Comment",
+        "Controllability", "Controllability Comment", "ASIL", "Safety Goal", "Safe State", "备注",
+    ],
     "FMEA": ["编号", "分析对象或接口", "功能", "失效模式", "失效原因", "局部影响", "整车影响", "是否可能形成危害", "现有控制", "安全措施"],
     "CTA": ["编号", "顶层危险行为", "相关功能不足", "触发条件", "条件组合", "可能后果", "针对性措施"],
     "STPA": ["编号", "控制结构", "控制动作", "不安全控制动作及其发生情境", "致因场景", "安全约束"],
@@ -24,8 +28,121 @@ FIELDS = {
 }
 ORDER = list(FIELDS)
 PREFIX = {"HARA": "H", "FMEA": "F", "CTA": "C", "STPA": "S", "TEST": "T"}
+HARA_MIN_ROWS = 50
 IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".webp"}
 TEXT_TYPES = {".txt", ".md", ".json", ".csv", ".tsv"}
+
+# ISO 26262-3 表 4：S/E/C 组合对应的 ASIL 等级。
+ASIL_TABLE = {
+    ("S1", "E1", "C1"): "QM", ("S1", "E1", "C2"): "QM", ("S1", "E1", "C3"): "QM",
+    ("S1", "E2", "C1"): "QM", ("S1", "E2", "C2"): "QM", ("S1", "E2", "C3"): "QM",
+    ("S1", "E3", "C1"): "QM", ("S1", "E3", "C2"): "QM", ("S1", "E3", "C3"): "ASIL A",
+    ("S1", "E4", "C1"): "QM", ("S1", "E4", "C2"): "ASIL A", ("S1", "E4", "C3"): "ASIL B",
+    ("S2", "E1", "C1"): "QM", ("S2", "E1", "C2"): "QM", ("S2", "E1", "C3"): "QM",
+    ("S2", "E2", "C1"): "QM", ("S2", "E2", "C2"): "QM", ("S2", "E2", "C3"): "ASIL A",
+    ("S2", "E3", "C1"): "QM", ("S2", "E3", "C2"): "ASIL A", ("S2", "E3", "C3"): "ASIL B",
+    ("S2", "E4", "C1"): "ASIL A", ("S2", "E4", "C2"): "ASIL B", ("S2", "E4", "C3"): "ASIL C",
+    ("S3", "E1", "C1"): "QM", ("S3", "E1", "C2"): "QM", ("S3", "E1", "C3"): "ASIL A",
+    ("S3", "E2", "C1"): "QM", ("S3", "E2", "C2"): "ASIL A", ("S3", "E2", "C3"): "ASIL B",
+    ("S3", "E3", "C1"): "ASIL A", ("S3", "E3", "C2"): "ASIL B", ("S3", "E3", "C3"): "ASIL C",
+    ("S3", "E4", "C1"): "ASIL B", ("S3", "E4", "C2"): "ASIL C", ("S3", "E4", "C3"): "ASIL D",
+}
+ASIL_RANK = {"QM": 0, "ASIL A": 1, "ASIL B": 2, "ASIL C": 3, "ASIL D": 4}
+SEVERITY_REASON = {
+    "S3": "碰撞相对速度大于20 km/h或车辆失稳后发生侧碰，按J2980取S3",
+    "S2": "碰撞相对速度约20 km/h或与固定设施碰撞，按J2980取S2",
+    "S1": "低速刮擦或轻微碰撞，AIS 1~6概率大于10%但伤害较轻，按J2980取S1",
+}
+
+# 参照 HARA Report 模板的驾驶情景，横向与纵向后果分开描述。
+HARA_SCENARIOS = [
+    {
+        "key": "straight", "label": "高速公路直道", "位置": "高速公路(ODD内)",
+        "道路条件": "直道，干燥路面",
+        "环境条件": "本车周围有交通流（前车、相邻车道和后方有车流）",
+        "本车车速": "车速60~110", "本车操作": "车道内行驶",
+        "E": "E4", "C": "C3", "s_adj": 0,
+        "e_comment": "高速公路场景占平均运行时间大于10%，取E4",
+        "c_comment": "系统主动控制横向运动，驾驶员超控需克服转向扭矩，少于90%的驾驶员能可靠避免危害，取C3",
+        "s_context": "高速直道车速60~110 km/h",
+        "lat": "与相邻车道车辆发生侧碰或撞向道路护栏",
+        "lon": "与前车发生追尾碰撞或撞向道路设施",
+    },
+    {
+        "key": "congestion", "label": "交通拥堵", "位置": "高速公路(ODD内)",
+        "道路条件": "直道，干燥路面，跟车距离短",
+        "环境条件": "交通拥堵，车速慢，跟车距离短或跟停",
+        "本车车速": "车速0~60", "本车操作": "车道内行驶",
+        "E": "E3", "C": "C3", "s_adj": -1,
+        "e_comment": "高速公路拥堵工况约占1%~10%运行时间，取E3",
+        "c_comment": "系统主动控制横向运动，驾驶员超控需克服转向扭矩，少于90%的驾驶员能可靠避免危害，取C3",
+        "s_context": "拥堵工况车速0~60 km/h",
+        "lat": "与相邻车辆发生低速刮擦或侧碰",
+        "lon": "与前车发生低速追尾，或紧急制动后被后车追尾",
+    },
+    {
+        "key": "curve", "label": "高速公路弯道", "位置": "高速公路(ODD内)",
+        "道路条件": "弯道，曲率半径≥400 m，干燥路面",
+        "环境条件": "本车周围有交通流（前车、相邻车道和后方有车流）",
+        "本车车速": "车速60~110", "本车操作": "车道内行驶",
+        "E": "E3", "C": "C3", "s_adj": 0,
+        "e_comment": "曲率半径≥400 m的弯道约占1%~10%运行时间，取E3",
+        "c_comment": "系统主动控制横向运动，驾驶员超控需克服转向扭矩，少于90%的驾驶员能可靠避免危害，取C3",
+        "s_context": "高速弯道车速60~110 km/h",
+        "lat": "与相邻车道车辆发生侧碰或驶出弯道",
+        "lon": "与弯道内前车发生追尾碰撞",
+    },
+    {
+        "key": "slippery", "label": "湿滑弯道", "位置": "高速公路(ODD内)",
+        "道路条件": "弯道，曲率半径≥400 m，路面湿滑",
+        "环境条件": "湿滑路面，可能出现侧向风",
+        "本车车速": "车速60~110", "本车操作": "车道内行驶",
+        "E": "E2", "C": "C3", "s_adj": 1,
+        "e_comment": "湿滑路面附着条件少见，出现概率小于1%，取E2",
+        "c_comment": "湿滑路面下车辆易失稳，驾驶员难以通过转向或制动恢复轨迹，取C3",
+        "s_context": "湿滑弯道车速60~110 km/h，车辆易失稳",
+        "lat": "车辆侧滑失稳后与其他车道车辆发生侧碰",
+        "lon": "制动距离增加，与前车发生追尾碰撞",
+    },
+    {
+        "key": "oddboundary", "label": "接近ODD边界", "位置": "高速公路(ODD内)，接近ODD边界",
+        "道路条件": "接近ODD边界（施工区域、收费站或高速尽头）",
+        "环境条件": "本车周围有交通流，存在施工或收费设施",
+        "本车车速": "车速60~110", "本车操作": "车道内行驶",
+        "E": "E4", "C": "C2", "s_adj": -1,
+        "e_comment": "接近ODD边界的情况每天都会发生，占运行时间大于10%，取E4",
+        "c_comment": "系统已请求驾驶员接管，多数驾驶员能及时制动或转向避让，90%以上可避免危害，取C2",
+        "s_context": "接近ODD边界，车速60~110 km/h",
+        "lat": "在施工区或收费站与设施或车辆发生碰撞",
+        "lon": "在施工区或收费站与前车或设施发生碰撞",
+    },
+]
+
+LATERAL_MODES = [
+    ("产生非预期横向偏移", "本车向相邻车道或路缘偏移", "避免LCC产生非预期横向控制", "偏离车道相关", 3),
+    ("产生反向转向", "本车向与期望相反的方向转向", "避免LCC输出反向转向", "偏离车道相关", 3),
+    ("横向控制能力不足（转向不足）", "本车横向位移不足以维持目标车道", "避免LCC横向控制能力不足", "偏离车道相关", 3),
+    ("横向控制过量（过度转向）", "本车横向位移超出目标行驶轨迹", "避免LCC过度横向控制", "偏离车道相关", 3),
+    ("转向输出卡滞", "转向输出保持在固定角度且不再更新", "避免LCC转向输出卡滞", "偏离车道相关", 3),
+    ("横向控制意外中断", "本车失去LCC横向控制能力", "避免LCC横向控制意外中断", "偏离车道相关", 3),
+    ("横向控制持续振荡", "本车在车道内持续左右摆动", "避免LCC横向控制振荡", "稳定性相关", 2),
+    ("横向响应明显滞后", "本车对弯道和道路变化的横向响应滞后", "避免LCC横向响应延迟", "偏离车道相关", 2),
+    ("跟随错误车道或错误目标", "本车跟随相邻车道或错误目标行驶", "避免LCC选择错误车道或目标", "偏离车道相关", 3),
+    ("超出ODD或未激活时输出横向控制", "功能未激活或超出ODD时仍输出横向控制", "避免LCC在ODD外或未激活时控制车辆", "激活与退出相关", 2),
+]
+
+LONGITUDINAL_MODES = [
+    ("出现非预期加速", "本车在无加速请求时加速", "避免功能产生非预期加速", "纵向控制相关", 2),
+    ("出现非预期减速", "本车在无减速请求时减速", "避免功能产生非预期减速", "纵向控制相关", 2),
+    ("制动减速度不足", "本车制动减速度不足以避免碰撞", "避免功能制动能力不足", "纵向控制相关", 3),
+    ("出现过度减速", "本车减速度明显大于需求", "避免功能过度减速", "纵向控制相关", 2),
+    ("未输出期望制动", "本车未按请求输出制动", "避免功能无法提供制动", "纵向控制相关", 3),
+    ("制动力卡滞不释放", "制动压力保持不释放", "避免功能制动力卡滞", "纵向控制相关", 2),
+    ("未对静止目标及时响应", "本车未对静止目标减速", "避免功能漏检静止目标", "纵向控制相关", 3),
+    ("对切入目标响应过晚", "本车对切入车辆响应滞后", "避免功能对切入目标响应过晚", "纵向控制相关", 3),
+    ("跟停与起步控制异常", "本车跟停后非预期起步或无法起步", "避免功能起步与跟停控制异常", "纵向控制相关", 2),
+    ("超出ODD或未激活时输出纵向控制", "功能未激活或超出ODD时仍控制车辆纵向运动", "避免功能在ODD外或未激活时控制车辆", "激活与退出相关", 2),
+]
 
 
 @dataclass
@@ -126,26 +243,44 @@ def schema_for(task: str) -> dict:
     fields = FIELDS[task]
     properties = {name: {"type": "string"} for name in fields}
     if task == "HARA":
-        for name, values in {"S": ["S1", "S2", "S3"], "E": ["E1", "E2", "E3", "E4"], "C": ["C1", "C2", "C3"], "ASIL": ["QM", "ASIL A", "ASIL B", "ASIL C", "ASIL D"]}.items():
+        for name, values in {
+            "Severity": ["S1", "S2", "S3"],
+            "Exposure": ["E1", "E2", "E3", "E4"],
+            "Controllability": ["C1", "C2", "C3"],
+            "ASIL": ["QM", "ASIL A", "ASIL B", "ASIL C", "ASIL D"],
+        }.items():
             properties[name] = {"type": "string", "enum": values}
     return {
         "type": "object", "additionalProperties": False,
         "properties": {
-            "assumptions": {"type": "array", "items": {"type": "string"}},
             "rows": {"type": "array", "items": {"type": "object", "additionalProperties": False,
                      "properties": properties, "required": fields}},
         },
-        "required": ["assumptions", "rows"],
+        "required": ["rows"],
     }
 
 
 def call_model(task: str, request: Request, references: list[Path], source_rows: list[dict], model: str) -> dict:
     source_ids = [str(row["编号"]) for row in source_rows]
+    minimum = HARA_MIN_ROWS if task == "HARA" else 2
+    if task == "HARA":
+        framework = (
+            "HARA 按 HARA Report 模板逐行输出：Hazard（[Hxxx] 编号与危害描述）、编号（HE 开头的唯一标识）、位置、道路条件、"
+            "环境条件、本车车速、本车操作、相关项工作状态、Potential Effect、Severity（S1~S3）、Severity Comment、"
+            "Exposure（E1~E4）、Exposure Comment、Controllability（C1~C3）、Controllability Comment、ASIL、"
+            "Safety Goal、Safe State、备注。ASIL 必须与 S/E/C 组合的 ISO 26262 查表结果一致。"
+        )
+    else:
+        framework = "按各任务字段逐条写出实质内容。"
     content: list[dict] = [{"type": "input_text", "text": (
         f"用户指令：{request.instruction}\n分析对象：{request.feature}\n只生成任务：{task}。\n"
         f"来源分析编号：{', '.join(source_ids) if source_ids else '无'}\n"
-        "请用中文生成专业但可修改的初稿，至少两条具有不同情境的具体分析条目。所有字段写出实质内容。无资料时明确列出关键通用假设。资料只支持其实际陈述的结构；不要猜测 ECU、传感器、接口名称。基于来源分析生成测试时保留对应编号。\n"
-        "HARA 必须提供 S/E/C 和 ASIL，按真实危险事件审慎评级；FMEA 只分析随机硬件/系统故障链；CTA 只分析预期功能不足与触发条件，不给 CTA 行赋 ASIL；STPA 使用控制动作和约束；测试用例需可执行、通过准则可观察。" )}]
+        f"请用中文生成专业但可修改的初稿，至少 {minimum} 条具有不同情境的具体分析条目。所有字段写出实质内容。"
+        f"{framework}"
+        "资料只支持其实际陈述的结构；不要猜测 ECU、传感器、接口名称。基于来源分析生成测试时保留对应编号。"
+        "HARA 必须逐条给出 S/E/C 评级理由，按真实危险事件审慎评级；FMEA 只分析随机硬件/系统故障链；"
+        "CTA 只分析预期功能不足与触发条件，不给 CTA 行赋 ASIL；STPA 使用控制动作和约束；测试用例需可执行、通过准则可观察。"
+    )}]
     if source_rows:
         content.append({"type": "input_text", "text": "来源分析条目（测试用例应逐项对应其风险、原因与措施）：\n" + json.dumps(source_rows, ensure_ascii=False)[:60000]})
     for path in references:
@@ -155,7 +290,7 @@ def call_model(task: str, request: Request, references: list[Path], source_rows:
             content.append({"type": "input_image", "image_url": image})
     payload = {
         "model": model,
-        "instructions": "你是自动驾驶功能安全与预期功能安全分析工程师。区分证据、假设与待确认项。不得编造未提供的具体架构。只返回符合 schema 的 JSON。",
+        "instructions": "你是自动驾驶功能安全与预期功能安全分析工程师。区分证据与假设，不得编造未提供的具体架构。只返回符合 schema 的 JSON。",
         "input": [{"role": "user", "content": content}],
         "text": {"format": {"type": "json_schema", "name": f"analysis_{task.lower()}", "strict": True, "schema": schema_for(task)}},
     }
@@ -176,10 +311,71 @@ def call_model(task: str, request: Request, references: list[Path], source_rows:
     return json.loads("".join(texts))
 
 
+def _asil_for(severity: str, exposure: str, controllability: str) -> str:
+    key = (severity.strip().upper(), exposure.strip().upper(), controllability.strip().upper())
+    if key not in ASIL_TABLE:
+        raise ValueError(f"无效的 S/E/C 组合：{severity}/{exposure}/{controllability}")
+    return ASIL_TABLE[key]
+
+
+def hara_rows(feature: str, instruction: str) -> list[dict]:
+    """按 HARA Report 模板生成 50 条危害事件：10 类失效 × 5 个驾驶情景。"""
+    lane = feature.upper() in {"LCC", "ALC", "LKA", "NOA"}
+    modes = LATERAL_MODES if lane else LONGITUDINAL_MODES
+    suffix = "lat" if lane else "lon"
+    rows: list[dict] = []
+    numbering = 0
+    for index, (hazard, effect, goal, note, base_severity) in enumerate(modes, 1):
+        goal_id = f"G{index:03d}"
+        goal = goal.replace("LCC", feature)
+        for scenario in HARA_SCENARIOS:
+            numbering += 1
+            severity = f"S{max(1, min(3, base_severity + scenario['s_adj']))}"
+            exposure, controllability = scenario["E"], scenario["C"]
+            asil = _asil_for(severity, exposure, controllability)
+            state = f"{feature}{'请求接管' if scenario['key'] == 'oddboundary' else '激活'}"
+            rows.append({
+                "Hazard": f"[H{numbering:03d}] {feature}在{scenario['label']}场景下{hazard}",
+                "编号": f"HE{numbering:04d}",
+                "位置": scenario["位置"],
+                "道路条件": scenario["道路条件"],
+                "环境条件": scenario["环境条件"],
+                "本车车速": scenario["本车车速"],
+                "本车操作": scenario["本车操作"],
+                "相关项工作状态": state,
+                "Potential Effect": f"{effect}，{scenario[suffix]}",
+                "Severity": severity,
+                "Severity Comment": f"{scenario['s_context']}；{SEVERITY_REASON[severity]}",
+                "Exposure": exposure,
+                "Exposure Comment": scenario["e_comment"],
+                "Controllability": controllability,
+                "Controllability Comment": scenario["c_comment"],
+                "ASIL": asil,
+                "Safety Goal": f"[{goal_id}] {goal}（ASIL {asil.replace('ASIL ', '') if asil != 'QM' else 'QM'}）",
+                "Safe State": f"退出 {feature} 控制并提示驾驶员接管",
+                "备注": note,
+            })
+    # 同一安全目标取所有相关危害事件中的最高 ASIL，与模板一致。
+    goal_level: dict[str, str] = {}
+    for row in rows:
+        goal_id = row["Safety Goal"][1:5]
+        current = goal_level.get(goal_id)
+        if current is None or ASIL_RANK[row["ASIL"]] > ASIL_RANK[current]:
+            goal_level[goal_id] = row["ASIL"]
+    for row in rows:
+        goal_id = row["Safety Goal"][1:5]
+        goal_text = row["Safety Goal"].split("（ASIL")[0]
+        level = goal_level[goal_id]
+        row["Safety Goal"] = f"{goal_text}（ASIL {level.replace('ASIL ', '') if level != 'QM' else 'QM'}）"
+    return rows
+
+
 def validate(task: str, data: dict, source_ids: list[str]) -> dict:
     if not isinstance(data, dict) or not isinstance(data.get("rows"), list) or not data["rows"]:
         raise ValueError(f"{task} 未生成分析条目。")
     fields = FIELDS[task]
+    if task == "HARA" and len(data["rows"]) < HARA_MIN_ROWS:
+        raise ValueError(f"HARA 需至少 {HARA_MIN_ROWS} 条，当前仅 {len(data['rows'])} 条。")
     for index, row in enumerate(data["rows"], 1):
         for field in fields:
             if field == "对应分析编号" and not source_ids:
@@ -187,12 +383,18 @@ def validate(task: str, data: dict, source_ids: list[str]) -> dict:
             if not isinstance(row.get(field), str) or not row[field].strip():
                 raise ValueError(f"{task} 第 {index} 条缺少必填字段：{field}")
         if task == "HARA":
-            for field, allowed in {"S": {"S1", "S2", "S3"}, "E": {"E1", "E2", "E3", "E4"}, "C": {"C1", "C2", "C3"}, "ASIL": {"QM", "ASIL A", "ASIL B", "ASIL C", "ASIL D"}}.items():
-                if row[field].upper() not in allowed:
+            for field, allowed in {
+                "Severity": {"S1", "S2", "S3"},
+                "Exposure": {"E1", "E2", "E3", "E4"},
+                "Controllability": {"C1", "C2", "C3"},
+            }.items():
+                row[field] = row[field].strip().upper()
+                if row[field] not in allowed:
                     raise ValueError(f"HARA 第 {index} 条的 {field} 值无效：{row[field]}")
+            # ASIL 由 S/E/C 唯一决定，统一按 ISO 26262 查表覆盖，避免评级不一致。
+            row["ASIL"] = _asil_for(row["Severity"], row["Exposure"], row["Controllability"])
         if task == "TEST" and source_ids and row["对应分析编号"] not in source_ids:
             raise ValueError(f"测试用例第 {index} 条引用了不存在的分析编号：{row['对应分析编号']}")
-    data["assumptions"] = [str(value) for value in data.get("assumptions", [])]
     return data
 
 
@@ -204,12 +406,8 @@ def template(task: str, feature: str, instruction: str, source_rows: list[dict])
     scenario = "高速公路弯道，车道线磨损" if curve and worn else "高速公路正常车道行驶"
     steering = "横向控制" if lane else "功能控制"
     event = "车辆偏离本车道，与相邻车辆或道路边界发生碰撞" if lane else "车辆未按预期执行功能，可能引发碰撞"
-    assumptions = [f"仅依据用户指令；假设 {feature} 为驾驶辅助功能，驾驶员持续监督且可接管。", "未提供车型、ODD、系统架构、既有安全机制或实测数据；所有评级与措施需项目团队复核。"]
     if task == "HARA":
-        rows = [
-            ["H-001", feature, scenario, f"{steering}产生非预期动作", "失去预期行驶轨迹", event, "S3", "E3", "C3", "ASIL D", "SG-01：防止非预期控制导致危险轨迹偏离"],
-            ["H-002", feature, "高速公路邻车并行且驾驶员短时未及时接管", f"{steering}在需要时中断", "车辆无法保持预期轨迹", event, "S3", "E3", "C2", "ASIL C", "SG-02：控制能力丧失时及时告警并进入可控状态"],
-        ]
+        rows = hara_rows(feature, instruction)
     elif task == "FMEA":
         rows = [
             ["F-001", f"{feature} 横向控制命令接口（逻辑边界，待架构确认）", "向执行端提供期望控制命令", "命令卡滞或重复", "通信或计算故障（待架构确认）", "控制命令与当前场景不匹配", event, "是", "待确认：命令时效性与合理性监测", "增加超时、序列号及幅值合理性校验，异常时抑制控制并告警"],
@@ -237,9 +435,9 @@ def template(task: str, feature: str, instruction: str, source_rows: list[dict])
         if source_rows:
             rows = []
             for index, source in enumerate(source_rows, 1):
-                concern = next((source[key] for key in ("危险事件", "整车影响", "顶层危险行为", "不安全控制动作及其发生情境") if source.get(key)), "功能危险行为")
+                concern = next((source[key] for key in ("Potential Effect", "危险事件", "整车影响", "顶层危险行为", "不安全控制动作及其发生情境") if source.get(key)), "功能危险行为")
                 stimulus = next((source[key] for key in ("失效原因", "触发条件", "致因场景", "车辆级失效行为") if source.get(key)), "模拟对应异常条件")
-                measure = next((source[key] for key in ("安全措施", "针对性措施", "安全约束", "安全目标") if source.get(key)), "限制危险控制并提示驾驶员")
+                measure = next((source[key] for key in ("安全措施", "针对性措施", "安全约束", "安全目标", "Safety Goal", "Safe State") if source.get(key)), "限制危险控制并提示驾驶员")
                 rows.append([f"T-{index:03d}", str(source["编号"]), f"验证 {concern} 的风险控制", source.get("运行场景", scenario), f"施加或模拟：{stimulus}", "1. 建立前置场景并激活功能；2. 注入所述条件；3. 记录功能状态、车辆轨迹和提示；4. 对照来源分析条目判定", f"系统执行对应安全响应：{measure}", f"未发生所述危险事件；按项目限值验证响应时间和效果：{measure}"])
         else:
             rows = [
@@ -248,4 +446,6 @@ def template(task: str, feature: str, instruction: str, source_rows: list[dict])
             ]
             if not lane:
                 rows[0] = ["T-001", "不适用（独立测试任务）", "验证场景适用性下降时系统安全响应", "功能激活，环境观测质量逐步下降", "注入低置信度环境或目标输入", "1. 建立场景并激活功能；2. 逐步降低输入质量；3. 记录车辆响应、功能状态和告警", "系统限制危险控制，必要时退出并提示驾驶员", "不出现非预期危险响应；在项目规定时间内退出或抑制控制并发出可感知提示"]
-    return {"assumptions": assumptions, "rows": [dict(zip(FIELDS[task], row)) for row in rows]}
+    if task == "HARA":
+        return {"rows": rows}
+    return {"rows": [dict(zip(FIELDS[task], row)) for row in rows]}

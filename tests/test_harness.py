@@ -19,16 +19,36 @@ class HarnessTests(unittest.TestCase):
             code = main(list(args))
         return code, stdout.getvalue(), stderr.getvalue()
 
-    def test_hara_only_text_and_ratings(self):
+    def test_hara_only_text_framework_and_count(self):
         code, output, error = self.invoke("分析高速 LCC 功能，生成 HARA，直接在终端回复。", "--backend", "template")
         self.assertEqual(code, 0, error)
         self.assertIn("## HARA", output)
-        self.assertIn("S：S3", output)
-        self.assertIn("E：E3", output)
-        self.assertIn("C：C3", output)
+        self.assertEqual(output.count("\n[HE"), 50)
+        self.assertIn("Hazard：[H001]", output)
+        self.assertIn("Potential Effect：", output)
+        self.assertIn("Severity Comment：", output)
+        self.assertIn("Controllability Comment：", output)
+        self.assertIn("Safety Goal：[G001]", output)
         self.assertIn("ASIL：ASIL D", output)
+        self.assertNotIn("关键假设", output)
         self.assertNotIn("## FMEA", output)
         self.assertNotIn("## TEST", output)
+
+    def test_hara_xlsx_columns_and_fifty_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hara.xlsx"
+            code, output, error = self.invoke("分析 LCC，生成 HARA，输出 XLSX。", "--backend", "template", "-o", str(path))
+            self.assertEqual(code, 0, error)
+            self.assertTrue(path.exists())
+            with ZipFile(path) as book:
+                sheet = book.read("xl/worksheets/sheet1.xml").decode()
+            for header in ("Hazard", "编号", "位置", "道路条件", "环境条件", "本车车速", "本车操作",
+                           "相关项工作状态", "Potential Effect", "Severity", "Severity Comment",
+                           "Exposure", "Exposure Comment", "Controllability", "Controllability Comment",
+                           "ASIL", "Safety Goal", "Safe State", "备注"):
+                self.assertIn(header, sheet)
+            self.assertEqual(sheet.count("<row "), 51)
+            self.assertIn("HE0050", sheet)
 
     def test_fmea_only_xlsx(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -79,14 +99,17 @@ class HarnessTests(unittest.TestCase):
             source = Path(tmp) / "hara.json"
             code, _, error = self.invoke("分析 LCC，生成 HARA", "--backend", "template", "--save-json", str(source))
             self.assertEqual(code, 0, error)
-            self.assertEqual(read_analysis_ids(source), ["H-001", "H-002"])
+            ids = read_analysis_ids(source)
+            self.assertEqual(len(ids), 50)
+            self.assertEqual(ids[0], "HE0001")
+            self.assertEqual(ids[-1], "HE0050")
             target = Path(tmp) / "tests.xlsx"
             code, _, error = self.invoke("根据 HARA 生成 LCC 测试用例，输出 XLSX", "--backend", "template", "--source-analysis", str(source), "-o", str(target))
             self.assertEqual(code, 0, error)
             with ZipFile(target) as book:
                 sheet = book.read("xl/worksheets/sheet1.xml").decode()
-            self.assertIn("H-001", sheet)
-            self.assertIn("H-002", sheet)
+            self.assertIn("HE0001", sheet)
+            self.assertIn("HE0002", sheet)
             self.assertEqual(parse_request("根据 HARA 生成 LCC 测试用例").tasks, ["TEST"])
 
     def test_model_receives_explicit_reference_and_only_requested_task(self):
