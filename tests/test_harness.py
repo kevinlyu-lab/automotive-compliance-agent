@@ -9,7 +9,7 @@ from unittest.mock import patch
 from zipfile import ZipFile
 
 from fusa_harness.cli import main
-from fusa_harness.core import parse_request, read_analysis_ids
+from fusa_harness.core import FSR_FIELDS, parse_request, read_analysis_ids
 
 
 class HarnessTests(unittest.TestCase):
@@ -154,6 +154,163 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertIn("OPENAI_API_KEY", error)
             self.assertFalse(output)
+
+    def test_fsr_tsr_routing_and_keywords(self):
+        self.assertEqual(parse_request("终端输出高速 车辆非预期转向风险的FSR").tasks, ["FSR"])
+        self.assertEqual(parse_request("终端输出高速 车辆非预期转向风险的TSR").tasks, ["TSR"])
+        self.assertEqual(parse_request("functional safety requirements for unintended steering").tasks, ["FSR"])
+        self.assertEqual(parse_request("technical safety requirements for braking loss").tasks, ["TSR"])
+        self.assertEqual(parse_request("分析 LCC 功能安全要求").tasks, ["FSR"])
+        self.assertEqual(parse_request("生成 FSR 和 TSR").tasks, ["FSR", "TSR"])
+        # 根据/基于之后的分析是上游输入，不应被同时当成要生成的任务。
+        self.assertEqual(parse_request("根据 HARA 推导高速车辆非预期转向风险的 FSR").tasks, ["FSR"])
+        self.assertEqual(parse_request("根据 FSR 生成 TSR").tasks, ["TSR"])
+        request = parse_request("终端输出高速 车辆非预期转向风险的FSR")
+        self.assertIn("车辆非预期转向", request.feature)
+        self.assertEqual(request.output, "text")
+        with self.assertRaises(ValueError) as caught:
+            parse_request("随便聊聊")
+        self.assertIn("FSR", str(caught.exception))
+        self.assertIn("TSR", str(caught.exception))
+
+    def test_fsr_single_sentence_draft(self):
+        code, output, error = self.invoke("终端输出高速 车辆非预期转向风险的FSR", "--backend", "template")
+        self.assertEqual(code, 0, error)
+        self.assertIn("## FSR", output)
+        self.assertIn("FSR-001", output)
+        self.assertIn("FSR-006", output)
+        self.assertIn("SG → FSR 追溯关系", output)
+        self.assertIn("安全状态（Safe State）", output)
+        self.assertIn("ASIL 等级：待确认", output)
+        self.assertIn("待确认", output)
+        self.assertIn("## 待补充资料与确认事项", output)
+        self.assertNotIn("## HARA", output)
+        self.assertNotIn("## TSR", output)
+
+    def test_tsr_single_sentence_draft(self):
+        code, output, error = self.invoke("终端输出高速 车辆非预期转向风险的TSR", "--backend", "template")
+        self.assertEqual(code, 0, error)
+        self.assertIn("## TSR", output)
+        self.assertIn("TSR-001", output)
+        self.assertIn("相关 FSR：", output)
+        self.assertIn("候选 FSR", output)
+        self.assertIn("FSR → TSR 追溯关系", output)
+        self.assertIn("## 待补充资料与确认事项", output)
+        self.assertIn("未提供 FSR/FSC", output)
+        self.assertNotIn("## FSR", output)
+        self.assertNotIn("## HARA", output)
+
+    def test_fsr_xlsx_sheet_and_pending_sheet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fsr.xlsx"
+            code, output, error = self.invoke("终端输出高速 车辆非预期转向风险的FSR，输出 XLSX。", "--backend", "template", "-o", str(path))
+            self.assertEqual(code, 0, error)
+            self.assertTrue(path.exists())
+            with ZipFile(path) as book:
+                names = book.read("xl/workbook.xml").decode()
+                sheet = book.read("xl/worksheets/sheet1.xml").decode()
+                notes = book.read("xl/worksheets/sheet2.xml").decode()
+            self.assertIn('name="FSR"', names)
+            self.assertIn('name="FSR-待确认"', names)
+            self.assertIn("FSR 编号", sheet)
+            self.assertIn("FSR-001", sheet)
+            self.assertEqual(sheet.count("<row "), 7)
+            self.assertIn("待补充资料", notes)
+
+    def test_fsr_from_hara_source_analysis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hara = Path(tmp) / "hara.json"
+            code, _, error = self.invoke("分析高速 LCC 功能，生成 HARA", "--backend", "template", "--save-json", str(hara))
+            self.assertEqual(code, 0, error)
+            code, output, error = self.invoke(
+                "根据 HARA 推导高速车辆非预期转向风险的 FSR", "--backend", "template", "--source-analysis", str(hara)
+            )
+            self.assertEqual(code, 0, error)
+            self.assertIn("## FSR", output)
+            self.assertIn("[G001]", output)
+            self.assertIn("ASIL 等级：ASIL D", output)
+            self.assertIn("G001 → FSR-001", output)
+            self.assertIn("已依据提供的 HARA 分析结果", output)
+            self.assertNotIn("未提供 HARA 分析结果", output)
+
+    def test_tsr_from_fsr_source_analysis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fsr = Path(tmp) / "fsr.json"
+            code, _, error = self.invoke("终端输出高速 车辆非预期转向风险的FSR", "--backend", "template", "--save-json", str(fsr))
+            self.assertEqual(code, 0, error)
+            self.assertEqual(read_analysis_ids(fsr), [f"FSR-{index:03d}" for index in range(1, 7)])
+            code, output, error = self.invoke("根据 FSR 生成 TSR", "--backend", "template", "--source-analysis", str(fsr))
+            self.assertEqual(code, 0, error)
+            self.assertIn("## TSR", output)
+            self.assertIn("FSR-003 → TSR-001", output)
+            self.assertIn("已依据提供的 FSR", output)
+
+    def test_reference_allowed_for_fsr_offline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = Path(tmp) / "architecture.txt"
+            reference.write_text("感知 -> 控制器 -> 转向执行器", encoding="utf-8")
+            code, output, error = self.invoke("分析高速车辆非预期转向风险的 FSR", "--backend", "template", "-r", str(reference))
+            self.assertEqual(code, 0, error)
+            self.assertIn("已接收参考资料：architecture.txt", output)
+
+    def test_reference_allowed_for_tsr_offline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = Path(tmp) / "fsc.txt"
+            reference.write_text("FSC：横向控制功能 -> 转向执行器", encoding="utf-8")
+            code, output, error = self.invoke("分析高速车辆非预期转向风险的 TSR", "--backend", "template", "-r", str(reference))
+            self.assertEqual(code, 0, error)
+            self.assertIn("## TSR", output)
+            self.assertIn("已接收参考资料：fsc.txt", output)
+
+    def test_tsr_from_hara_marks_candidate_fsr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hara = Path(tmp) / "hara.json"
+            code, _, error = self.invoke("分析高速 LCC 功能，生成 HARA", "--backend", "template", "--save-json", str(hara))
+            self.assertEqual(code, 0, error)
+            code, output, error = self.invoke(
+                "根据 HARA 推导高速车辆非预期转向风险的 TSR", "--backend", "template", "--source-analysis", str(hara)
+            )
+            self.assertEqual(code, 0, error)
+            self.assertIn("## TSR", output)
+            self.assertIn("候选 FSR-003", output)
+            self.assertIn("ASIL 等级：ASIL D", output)
+            self.assertIn("候选 FSR 为待确认的上游要求", output)
+
+    def test_model_fsr_prompt_schema_and_notes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hara = Path(tmp) / "hara.json"
+            code, _, error = self.invoke("分析高速 LCC 功能，生成 HARA", "--backend", "template", "--save-json", str(hara))
+            self.assertEqual(code, 0, error)
+            row = {field: "待确认（示例）" for field in FSR_FIELDS}
+            row["FSR 编号"] = "FSR-001"
+            captured = []
+
+            class FakeResponse:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_):
+                    return None
+
+                def read(self):
+                    return json.dumps({"status": "completed", "output": [{"content": [{"type": "output_text", "text": json.dumps({"rows": [row], "notes": ["待补充 HARA 确认记录"]}, ensure_ascii=False)}]}]}).encode()
+
+            def fake_urlopen(request, timeout):
+                captured.append(json.loads(request.data))
+                return FakeResponse()
+
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}), patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                code, output, error = self.invoke(
+                    "根据 HARA 推导高速车辆非预期转向风险的 FSR", "--source-analysis", str(hara)
+                )
+            self.assertEqual(code, 0, error)
+            self.assertEqual(captured[0]["text"]["format"]["name"], "analysis_fsr")
+            self.assertIn("notes", captured[0]["text"]["format"]["schema"]["required"])
+            prompt = json.dumps(captured[0], ensure_ascii=False)
+            self.assertIn("ISO 26262-3:2018 Clause 7", prompt)
+            self.assertIn("HE0001", prompt)
+            self.assertIn("## FSR", output)
+            self.assertIn("待补充 HARA 确认记录", output)
 
 
 if __name__ == "__main__":

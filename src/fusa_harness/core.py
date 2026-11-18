@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from zipfile import ZipFile
 
+from .safety import FSR_FIELDS, TSR_FIELDS, default_notes, describe, fsr_draft, tsr_draft
+
 
 FIELDS = {
     "HARA": [
@@ -25,9 +27,21 @@ FIELDS = {
     "CTA": ["编号", "顶层危险行为", "相关功能不足", "触发条件", "条件组合", "可能后果", "针对性措施"],
     "STPA": ["编号", "控制结构", "控制动作", "不安全控制动作及其发生情境", "致因场景", "安全约束"],
     "TEST": ["编号", "对应分析编号", "测试目标", "场景与前置条件", "输入或故障注入", "执行步骤", "预期表现", "通过准则"],
+    "FSR": FSR_FIELDS,
+    "TSR": TSR_FIELDS,
 }
 ORDER = list(FIELDS)
-PREFIX = {"HARA": "H", "FMEA": "F", "CTA": "C", "STPA": "S", "TEST": "T"}
+PREFIX = {"HARA": "H", "FMEA": "F", "CTA": "C", "STPA": "S", "TEST": "T", "FSR": "FSR", "TSR": "TSR"}
+TASK_PATTERNS = {
+    "HARA": r"HARA|危害分析(?:和风险评估)?",
+    "FMEA": r"FMEA|失效模式(?:与影响)?分析",
+    "CTA": r"CTA|触发条件分析",
+    "STPA": r"STPA|系统理论过程分析",
+    "TEST": r"测试用例|测试案例|test cases?",
+    "FSR": r"FSR|功能安全要求|Functional\s+Safety\s+Requirements",
+    "TSR": r"TSR|技术安全要求|Technical\s+Safety\s+Requirements",
+}
+ROW_ID_FIELDS = ("编号", "FSR 编号", "TSR 编号")
 HARA_MIN_ROWS = 50
 IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".webp"}
 TEXT_TYPES = {".txt", ".md", ".json", ".csv", ".tsv"}
@@ -153,28 +167,79 @@ class Request:
     output: str
 
 
+_SOURCE_MARKER = re.compile(
+    r"根据|基于|依据|参考|结合|参照|按照|利用|使用|\b(?:based\s+on|according\s+to|from|using)\b", re.I
+)
+_ACTION = re.compile(
+    r"生成|编写|推导|制定|设计|输出|导出|得到|形成|给出|开展|进行|整理|做|"
+    r"\b(?:generate|derive|create|write|produce|develop|output|export)\b",
+    re.I,
+)
+_DEFER = re.compile(r"的")
+
+
+def _clause_mentions(clause: str) -> list[tuple[int, str]]:
+    return sorted(
+        (match.start(), task)
+        for task in ORDER
+        for match in re.finditer(TASK_PATTERNS[task], clause, re.I)
+    )
+
+
+def _requested_tasks(task_text: str) -> list[str]:
+    """Detect requested tasks, treating analysis named after 根据/基于 as upstream input.
+
+    The upstream rule only applies once FSR/TSR are present, so routing of the original five
+    task types is unchanged.
+    """
+    found = [task for task in ORDER if re.search(TASK_PATTERNS[task], task_text, re.I)]
+    if not (set(found) & {"FSR", "TSR"}):
+        return found
+    kept: list[str] = []
+    for clause in re.split(r"[，,。；;：:\n]", task_text):
+        mentions = _clause_mentions(clause)
+        if not mentions:
+            continue
+        clause_tasks = [task for _, task in mentions]
+        markers = list(_SOURCE_MARKER.finditer(clause))
+        if not markers or not (set(clause_tasks) & {"FSR", "TSR"}):
+            kept.extend(clause_tasks)
+            continue
+        action = _ACTION.search(clause)
+        requested: list[str] = []
+        if action:
+            for position, task in mentions:
+                marker = next((item for item in markers if item.end() <= position), None)
+                # 来源标记与任务之间若没有生成类动词，该任务属于上游输入。
+                if marker and not (marker.end() <= action.start() < position):
+                    continue
+                requested.append(task)
+        else:
+            defer = _DEFER.search(clause)
+            requested = [task for position, task in mentions if defer and position > defer.start()] if defer else []
+        kept.extend(requested)
+    kept = [task for task in ORDER if task in kept]
+    return kept or found
+
+
 def parse_request(instruction: str, output_override: str | None = None) -> Request:
     text = instruction.strip()
     if not text:
         raise ValueError("请输入分析指令。")
     # A named analysis after 根据/基于 is source material for a test request, not another requested task.
     task_text = re.sub(r"(?:根据|基于)[^，,。；;]*?(?:HARA|FMEA|CTA|STPA|危害分析|失效分析)[^，,。；;]*?(?:生成|编写|设计)[^，,。；;]*?测试用例", "生成测试用例", text, flags=re.I)
-    patterns = {
-        "HARA": r"HARA|危害分析(?:和风险评估)?",
-        "FMEA": r"FMEA|失效模式(?:与影响)?分析",
-        "CTA": r"CTA|触发条件分析",
-        "STPA": r"STPA|系统理论过程分析",
-        "TEST": r"测试用例|测试案例|test cases?",
-    }
-    tasks = [task for task in ORDER if re.search(patterns[task], task_text, re.I)]
+    tasks = _requested_tasks(task_text)
     if not tasks:
-        raise ValueError("未识别到任务类型；请指定 HARA、系统 FMEA、CTA、STPA 或测试用例。")
+        raise ValueError("未识别到任务类型；请指定 HARA、系统 FMEA、CTA、STPA、测试用例、FSR 或 TSR。")
     match = re.search(r"\b(LCC|ALC|ACC|AEB|LKA|NOA)\b", text, re.I)
     if match:
         feature = match.group(1).upper()
+    elif (match := re.search(r"(?:针对|对|分析|评估)\s*([^，,。；;]{2,40}?)(?:功能)?\s*(?:在|生成|开展|进行|做|的|，|,)", text)):
+        feature = match.group(1).strip()
+    elif set(tasks) <= {"FSR", "TSR"}:
+        feature = describe(text)["feature"]
     else:
-        match = re.search(r"(?:针对|对|分析|评估)\s*([^，,。；;]{2,40}?)(?:功能)?\s*(?:在|生成|开展|进行|做|的|，|,)", text)
-        feature = match.group(1).strip() if match else "用户描述的自动驾驶功能"
+        feature = "用户描述的自动驾驶功能"
     output = output_override or ("xlsx" if re.search(r"XLSX|EXCEL|电子表格|导出.*表格", text, re.I) else "text")
     return Request(text, feature, tasks, output)
 
@@ -205,12 +270,20 @@ def read_reference(path: Path) -> tuple[str, str | None]:
     raise ValueError(f"不支持的参考文件类型：{suffix}")
 
 
+def _row_number(row: dict) -> str:
+    for field in ROW_ID_FIELDS:
+        value = row.get(field)
+        if value:
+            return str(value)
+    return ""
+
+
 def read_analysis_rows(path: Path) -> list[dict[str, str]]:
     if not path.is_file():
         raise ValueError(f"分析文件不存在：{path}")
     if path.suffix.lower() == ".json":
         data = json.loads(path.read_text(encoding="utf-8"))
-        return [row for section in data.get("analyses", []) for row in section.get("rows", []) if row.get("编号")]
+        return [row for section in data.get("analyses", []) for row in section.get("rows", []) if _row_number(row)]
     if path.suffix.lower() == ".xlsx":
         analysis_rows = []
         ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
@@ -223,20 +296,21 @@ def read_analysis_rows(path: Path) -> list[dict[str, str]]:
                 if not rows:
                     continue
                 header = ["".join(c.itertext()) for c in rows[0].findall("m:c", ns)]
-                if "编号" not in header:
+                id_header = next((item for item in header if "编号" in item), None)
+                if id_header is None:
                     continue
                 for row in rows[1:]:
                     cells = row.findall("m:c", ns)
                     values = ["".join(cell.itertext()).strip() for cell in cells]
                     item = dict(zip(header, values))
-                    if item.get("编号"):
+                    if _row_number(item):
                         analysis_rows.append(item)
         return analysis_rows
     raise ValueError("来源分析仅支持本工具导出的 JSON 或 XLSX 文件。")
 
 
 def read_analysis_ids(path: Path) -> list[str]:
-    return [str(row["编号"]) for row in read_analysis_rows(path)]
+    return [_row_number(row) for row in read_analysis_rows(path)]
 
 
 def schema_for(task: str) -> dict:
@@ -250,19 +324,23 @@ def schema_for(task: str) -> dict:
             "ASIL": ["QM", "ASIL A", "ASIL B", "ASIL C", "ASIL D"],
         }.items():
             properties[name] = {"type": "string", "enum": values}
+    required = ["rows"]
+    if task in {"FSR", "TSR"}:
+        required.append("notes")
     return {
         "type": "object", "additionalProperties": False,
         "properties": {
             "rows": {"type": "array", "items": {"type": "object", "additionalProperties": False,
                      "properties": properties, "required": fields}},
+            **({"notes": {"type": "array", "items": {"type": "string"}}} if task in {"FSR", "TSR"} else {}),
         },
-        "required": ["rows"],
+        "required": required,
     }
 
 
 def call_model(task: str, request: Request, references: list[Path], source_rows: list[dict], model: str) -> dict:
-    source_ids = [str(row["编号"]) for row in source_rows]
-    minimum = HARA_MIN_ROWS if task == "HARA" else 2
+    source_ids = [_row_number(row) for row in source_rows]
+    minimum = HARA_MIN_ROWS if task == "HARA" else 6 if task in {"FSR", "TSR"} else 2
     if task == "HARA":
         framework = (
             "HARA 按 HARA Report 模板逐行输出：Hazard（[Hxxx] 编号与危害描述）、编号（HE 开头的唯一标识）、位置、道路条件、"
@@ -270,19 +348,56 @@ def call_model(task: str, request: Request, references: list[Path], source_rows:
             "Exposure（E1~E4）、Exposure Comment、Controllability（C1~C3）、Controllability Comment、ASIL、"
             "Safety Goal、Safe State、备注。ASIL 必须与 S/E/C 组合的 ISO 26262 查表结果一致。"
         )
+        rules = (
+            "资料只支持其实际陈述的结构；不要猜测 ECU、传感器、接口名称。基于来源分析生成测试时保留对应编号。"
+            "HARA 必须逐条给出 S/E/C 评级理由，按真实危险事件审慎评级；FMEA 只分析随机硬件/系统故障链；"
+            "CTA 只分析预期功能不足与触发条件，不给 CTA 行赋 ASIL；STPA 使用控制动作和约束；测试用例需可执行、通过准则可观察。"
+        )
+        source_hint = "来源分析条目（测试用例应逐项对应其风险、原因与措施）"
+    elif task == "FSR":
+        framework = (
+            "FSR 依据 ISO 26262-3:2018 Clause 7 生成，逐条输出字段：FSR 编号（FSR-001 起）、功能或风险描述、"
+            "相关安全目标（SG）、ASIL 等级、FSR 具体要求、故障检测与控制策略、安全状态（Safe State）、"
+            "功能降级和应急运行策略、安全时间要求（FTTI/FHTI）、FSR 分配对象、验证和验收准则、SG → FSR 追溯关系、"
+            "依据与待确认事项。每条要求使用“系统应……”的系统安全需求语言，单条独立、清晰、可追溯、可验证。"
+        )
+        rules = (
+            "未提供 HARA、SG 或 ASIL 依据时，SG 与 ASIL 只能标注为候选/待确认，不得给出确定等级；"
+            "不得虚构 FTTI、故障检测时间、ECU、传感器或接口名称；缺少依据处写“待确认”并说明需要补充的资料。"
+            "用户仅给出功能或风险描述时，结果注明为初步草案；提供 HARA 时，逐条建立 SG → FSR 追溯。"
+        )
+        source_hint = "来源分析条目（提供 HARA 时应沿用其安全目标与 ASIL，并逐条建立 SG → FSR 追溯）"
+    elif task == "TSR":
+        framework = (
+            "TSR 依据 ISO 26262-4:2018 Clause 6 生成，为系统、硬件和软件开发提供输入。逐条输出字段：TSR 编号（TSR-001 起）、"
+            "相关安全目标（SG）、相关 FSR、ASIL 等级、TSR 具体要求、技术安全机制、故障检测及诊断方式、"
+            "故障响应与安全状态切换、安全时间约束、系统接口和通信安全要求、分配对象（系统/硬件/软件）、"
+            "验证方法和验收准则、FSR → TSR 追溯关系、依据与待确认事项。TSR 必须比 FSR 更具体，给出可实现的机制、"
+            "诊断手段与接口约束。"
+        )
+        rules = (
+            "未提供 FSR 或 FSC 时，可先推导候选 FSR 并据此生成 TSR，但必须在相关 FSR 与追溯字段注明其为待确认的上游要求；"
+            "未提供 ASIL 依据时不得给出确定等级；不得虚构 FTTI、故障检测时间、ECU、传感器或接口名称；"
+            "接口、阈值与时间数值缺少依据处写“待确认”并说明需要补充的资料。"
+        )
+        source_hint = "来源分析条目（提供 FSR 时应逐条建立 FSR → TSR 追溯；提供 HARA 时应先推导候选 FSR）"
     else:
         framework = "按各任务字段逐条写出实质内容。"
+        rules = (
+            "资料只支持其实际陈述的结构；不要猜测 ECU、传感器、接口名称。基于来源分析生成测试时保留对应编号。"
+            "HARA 必须逐条给出 S/E/C 评级理由，按真实危险事件审慎评级；FMEA 只分析随机硬件/系统故障链；"
+            "CTA 只分析预期功能不足与触发条件，不给 CTA 行赋 ASIL；STPA 使用控制动作和约束；测试用例需可执行、通过准则可观察。"
+        )
+        source_hint = "来源分析条目（测试用例应逐项对应其风险、原因与措施）"
     content: list[dict] = [{"type": "input_text", "text": (
         f"用户指令：{request.instruction}\n分析对象：{request.feature}\n只生成任务：{task}。\n"
         f"来源分析编号：{', '.join(source_ids) if source_ids else '无'}\n"
         f"请用中文生成专业但可修改的初稿，至少 {minimum} 条具有不同情境的具体分析条目。所有字段写出实质内容。"
         f"{framework}"
-        "资料只支持其实际陈述的结构；不要猜测 ECU、传感器、接口名称。基于来源分析生成测试时保留对应编号。"
-        "HARA 必须逐条给出 S/E/C 评级理由，按真实危险事件审慎评级；FMEA 只分析随机硬件/系统故障链；"
-        "CTA 只分析预期功能不足与触发条件，不给 CTA 行赋 ASIL；STPA 使用控制动作和约束；测试用例需可执行、通过准则可观察。"
+        f"{rules}"
     )}]
     if source_rows:
-        content.append({"type": "input_text", "text": "来源分析条目（测试用例应逐项对应其风险、原因与措施）：\n" + json.dumps(source_rows, ensure_ascii=False)[:60000]})
+        content.append({"type": "input_text", "text": f"{source_hint}：\n" + json.dumps(source_rows, ensure_ascii=False)[:60000]})
     for path in references:
         body, image = read_reference(path)
         content.append({"type": "input_text", "text": f"参考资料 {path.name}：\n{body}"} if image is None else {"type": "input_text", "text": f"参考架构图 {path.name}："})
@@ -290,7 +405,7 @@ def call_model(task: str, request: Request, references: list[Path], source_rows:
             content.append({"type": "input_image", "image_url": image})
     payload = {
         "model": model,
-        "instructions": "你是自动驾驶功能安全与预期功能安全分析工程师。区分证据与假设，不得编造未提供的具体架构。只返回符合 schema 的 JSON。",
+        "instructions": "你是自动驾驶功能安全与预期功能安全分析工程师。区分证据与假设，不得编造未提供的具体架构。FSR/TSR 中缺少依据的信息必须标注为待确认。只返回符合 schema 的 JSON。",
         "input": [{"role": "user", "content": content}],
         "text": {"format": {"type": "json_schema", "name": f"analysis_{task.lower()}", "strict": True, "schema": schema_for(task)}},
     }
@@ -395,11 +510,20 @@ def validate(task: str, data: dict, source_ids: list[str]) -> dict:
             row["ASIL"] = _asil_for(row["Severity"], row["Exposure"], row["Controllability"])
         if task == "TEST" and source_ids and row["对应分析编号"] not in source_ids:
             raise ValueError(f"测试用例第 {index} 条引用了不存在的分析编号：{row['对应分析编号']}")
+    if task in {"FSR", "TSR"}:
+        notes = data.get("notes")
+        notes = [str(note).strip() for note in notes if str(note).strip()] if isinstance(notes, list) else []
+        # 结果末尾必须给出待补充资料；模型未给出时使用与任务对应的默认清单。
+        data["notes"] = notes or default_notes(task)
     return data
 
 
 def template(task: str, feature: str, instruction: str, source_rows: list[dict]) -> dict:
     """Conservative offline drafts; no source documents are accepted here."""
+    if task == "FSR":
+        return fsr_draft(feature, instruction, source_rows)
+    if task == "TSR":
+        return tsr_draft(feature, instruction, source_rows)
     lane = feature.upper() in {"LCC", "ALC", "LKA"}
     curve = "弯道" in instruction
     worn = "磨损" in instruction or "模糊" in instruction
