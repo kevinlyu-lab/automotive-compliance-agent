@@ -24,7 +24,3 @@ fusa-harness "终端输出高速 车辆非预期转向风险的TSR"
 fusa-harness "根据 HARA 推导高速车辆非预期转向风险的 FSR" --source-analysis hara.json
 fusa-harness "根据 FSR 生成 TSR" --source-analysis fsr.json
 ```
-
-## FSR / TSR 说明
-
-- FSR 依据 ISO 26262-3:2018 Clause 7，TSR 依据 ISO 26262-4:2018 Clause 6。
