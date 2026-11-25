@@ -11,8 +11,12 @@ from pathlib import Path
 from .core import FIELDS, Request, _row_number, call_model, parse_request, read_analysis_rows, template, validate
 from .xlsx import write_xlsx
 
-SOURCE_TASKS = {"TEST", "FSR", "TSR"}
+SOURCE_TASKS = {"TEST", "FSR", "TSR", "CTA", "STPA", "FMEA"}
 SECTION_TITLES = {
+    "HARA": "## HARA",
+    "FMEA": "## FMEA（SOTIF 导向归纳分析，ISO 21448:2022）",
+    "CTA": "## CTA（因果树分析，ISO 21448:2022 Clause 7）",
+    "STPA": "## STPA（系统理论过程分析，MIT STPA Handbook / ISO 21448:2022）",
     "FSR": "## FSR（ISO 26262-3:2018 Clause 7）",
     "TSR": "## TSR（ISO 26262-4:2018 Clause 6）",
 }
@@ -23,10 +27,22 @@ def render_text(request: Request, analyses: list[dict]) -> str:
     for section in analyses:
         task = section["task"]
         blocks.extend(["", SECTION_TITLES.get(task, f"## {task}")])
-        for row in section["rows"]:
-            blocks.append("")
-            blocks.append(f"[{_row_number(row)}]")
-            blocks.extend(f"{field}：{row[field]}" for field in FIELDS[task] if field != "编号")
+        if section.get("sections"):
+            multiple = len(section["sections"]) > 1
+            for index, part in enumerate(section["sections"], 1):
+                if multiple:
+                    blocks.extend(["", f"### {index}. {part['name']}"])
+                for row in part["rows"]:
+                    blocks.append("")
+                    number = _row_number(row)
+                    if number:
+                        blocks.append(f"[{number}]")
+                    blocks.extend(f"{field}：{row[field]}" for field in part["fields"])
+        else:
+            for row in section["rows"]:
+                blocks.append("")
+                blocks.append(f"[{_row_number(row)}]")
+                blocks.extend(f"{field}：{row[field]}" for field in FIELDS[task] if field != "编号")
     gaps = [(section["task"], note) for section in analyses for note in section.get("notes", [])]
     if gaps:
         blocks.extend(["", "## 待补充资料与确认事项"])
@@ -36,7 +52,7 @@ def render_text(request: Request, analyses: list[dict]) -> str:
 
 def run(request: Request, references: list[Path], source_analysis: Path | None, backend: str, model: str) -> list[dict]:
     if source_analysis and not (set(request.tasks) & SOURCE_TASKS):
-        raise ValueError("--source-analysis 仅用于测试用例、FSR 或 TSR 任务。")
+        raise ValueError("--source-analysis 仅用于测试用例、FSR、TSR、CTA、STPA 或 FMEA 任务。")
     source_rows = read_analysis_rows(source_analysis) if source_analysis else []
     source_ids = [_row_number(row) for row in source_rows]
     if source_analysis and not source_rows:
@@ -80,10 +96,17 @@ def main(argv: list[str] | None = None) -> int:
             sheets = []
             for section in analyses:
                 task = section["task"]
-                fields = FIELDS[task]
-                sheets.append((task, fields, [[row[field] for field in fields] for row in section["rows"]]))
+                if section.get("sections"):
+                    # 每种方法按分析步骤分表，不把多种方法塞进同一张通用表。
+                    for part in section["sections"]:
+                        name = part["name"] if task == "FMEA" else f"{task}-{part['name']}"
+                        sheets.append((name[:31], part["fields"], [[row[field] for field in part["fields"]] for row in part["rows"]]))
+                else:
+                    fields = FIELDS[task]
+                    sheets.append((task, fields, [[row[field] for field in fields] for row in section["rows"]]))
                 if section.get("notes"):
-                    sheets.append((f"{task}-待确认", ["待补充资料与确认事项"], [[note] for note in section["notes"]]))
+                    title = f"{task}-待确认"
+                    sheets.append((title[:31], ["待补充资料与确认事项"], [[note] for note in section["notes"]]))
             write_xlsx(path, sheets)
             print(f"已生成：{path.resolve()}")
         else:

@@ -61,8 +61,12 @@ class HarnessTests(unittest.TestCase):
                 sheet = book.read("xl/worksheets/sheet1.xml").decode()
             self.assertIn('name="FMEA"', names)
             self.assertNotIn('name="HARA"', names)
-            self.assertIn("失效模式", sheet)
+            # SOTIF 导向 FMEA：列名必须对应「性能局限 → 触发条件 → 输出不足 → 危害行为 → 措施 → 验证」链条
+            for header in ("功能定义不足或性能局限", "触发条件", "输出不足", "整车危害行为",
+                           "危害事件", "SOTIF 措施", "验证方式"):
+                self.assertIn(header, sheet)
             self.assertIn("F-001", sheet)
+            self.assertNotIn("失效模式", sheet)
 
     def test_independent_test_case_xlsx(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -117,10 +121,12 @@ class HarnessTests(unittest.TestCase):
             source = Path(tmp) / "architecture.txt"
             source.write_text("图示：车道线识别模块 -> ALC 控制逻辑 -> 转向命令接口", encoding="utf-8")
             row = {
-                "编号": "F-101", "分析对象或接口": "转向命令接口", "功能": "传递转向命令",
-                "失效模式": "命令丢失", "失效原因": "通信中断", "局部影响": "指令无法到达",
-                "整车影响": "横向控制中断", "是否可能形成危害": "是",
-                "现有控制": "资料未说明", "安全措施": "监测超时并提示接管",
+                "编号": "F-101", "分析对象或功能": "转向命令接口", "要素层级": "系统要素",
+                "功能定义不足或性能局限": "接口未定义指令时效性", "触发条件": "高负载总线",
+                "输出不足": "指令到达过晚", "整车危害行为": "横向控制响应滞后",
+                "危害事件": "车辆偏离本车道", "现有控制措施": "资料未说明",
+                "SOTIF 措施": "定义超时与序列号校验", "验证方式": "总线负载压力测试",
+                "残余风险说明": "待确认",
             }
             captured = []
 
@@ -311,6 +317,119 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("HE0001", prompt)
             self.assertIn("## FSR", output)
             self.assertIn("待补充 HARA 确认记录", output)
+
+
+    def test_cta_text_sections_gates_and_default_scenario(self):
+        code, output, error = self.invoke("分析 LCC，生成 CTA", "--backend", "template")
+        self.assertEqual(code, 0, error)
+        self.assertIn("## CTA", output)
+        for index, name in enumerate(("顶事件", "因果树", "底事件", "最小割集"), 1):
+            self.assertIn(f"### {index}. {name}", output)
+        # AND/OR 必须同时出现，割集编号可读
+        self.assertIn("逻辑门：AND", output)
+        self.assertIn("逻辑门：OR", output)
+        self.assertIn("MCS-001", output)
+        self.assertIn("阶数：1 阶", output)
+        # 未给场景时自主补全，并在分析边界中声明
+        self.assertIn("待项目确认", output)
+        self.assertIn("不包含随机硬件失效", output)
+        self.assertNotIn("## STPA", output)
+        self.assertNotIn("## FMEA", output)
+
+    def test_cta_cut_sets_are_minimal_and_derived_from_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cta.json"
+            code, _, error = self.invoke("分析高速 LCC，生成 CTA", "--backend", "template", "--save-json", str(path))
+            self.assertEqual(code, 0, error)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            sections = {item["name"]: item["rows"] for item in data["analyses"][0]["sections"]}
+            leaves = {row["底事件编号"] for row in sections["底事件"]}
+            cuts = []
+            for row in sections["最小割集"]:
+                cut = set(row["布尔表达式"].replace(" ", "").split("·"))
+                self.assertTrue(cut <= leaves, cut)
+                self.assertEqual(row["阶数"], f"{len(cut)} 阶")
+                cuts.append(cut)
+            # 最小性：不存在两个割集互为真子集
+            for first in cuts:
+                for second in cuts:
+                    if first != second:
+                        self.assertFalse(first < second, f"{first} 是 {second} 的真子集，割集未消减")
+            # AND 分支（≥2 阶）与 OR 分支（1 阶）都应出现
+            self.assertEqual(min(len(cut) for cut in cuts), 1)
+            self.assertGreaterEqual(max(len(cut) for cut in cuts), 2)
+
+    def test_stpa_text_sections_and_four_uca_types(self):
+        code, output, error = self.invoke("分析高速 ALC，生成 STPA", "--backend", "template")
+        self.assertEqual(code, 0, error)
+        self.assertIn("## STPA", output)
+        for index, name in enumerate(("损失与危害", "控制结构", "不安全控制行为", "原因场景", "安全约束"), 1):
+            self.assertIn(f"### {index}. {name}", output)
+        for kind in ("未提供", "提供导致危害", "时序错误", "持续时间错误"):
+            self.assertIn(kind, output)
+        self.assertIn("UCA-1", output)
+        self.assertIn("不足条件（IC）", output)
+        self.assertIn("因果因素（CF）", output)
+        self.assertIn("SC-1", output)
+        self.assertNotIn("## CTA", output)
+        self.assertNotIn("ASIL", output)
+
+    def test_fmea_rows_follow_sotif_chain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fmea.json"
+            code, _, error = self.invoke("针对 LCC 在逆光高速场景开展 SOTIF FMEA", "--backend", "template", "--save-json", str(path))
+            self.assertEqual(code, 0, error)
+            rows = json.loads(path.read_text(encoding="utf-8"))["analyses"][0]["rows"]
+            self.assertGreaterEqual(len(rows), 6)
+            for row in rows:
+                for field in ("功能定义不足或性能局限", "触发条件", "输出不足", "整车危害行为", "危害事件", "SOTIF 措施", "验证方式"):
+                    self.assertTrue(row[field].strip(), field)
+                # 性能局限不得写成硬件损坏
+                self.assertNotIn("硬件损坏", " ".join(row.values()))
+                self.assertNotIn("元器件失效", " ".join(row.values()))
+            self.assertTrue(any("逆光" in row["触发条件"] for row in rows))
+
+    def test_cta_schema_is_sectioned_by_analysis_step(self):
+        from fusa_harness.core import schema_for
+
+        schema = schema_for("CTA")
+        names = [item["properties"]["name"]["enum"][0] for item in schema["properties"]["sections"]["items"]["anyOf"]]
+        self.assertEqual(names, ["顶事件", "因果树", "底事件", "最小割集"])
+        self.assertIn("notes", schema["required"])
+        stpa_names = [item["properties"]["name"]["enum"][0] for item in schema_for("STPA")["properties"]["sections"]["items"]["anyOf"]]
+        self.assertEqual(stpa_names, ["损失与危害", "控制结构", "不安全控制行为", "原因场景", "安全约束"])
+
+    def test_cta_from_hara_source_analysis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hara = Path(tmp) / "hara.json"
+            code, _, error = self.invoke("分析高速 LCC 功能，生成 HARA", "--backend", "template", "--save-json", str(hara))
+            self.assertEqual(code, 0, error)
+            code, output, error = self.invoke(
+                "根据 HARA 生成高速 LCC 的 CTA", "--backend", "template", "--source-analysis", str(hara)
+            )
+            self.assertEqual(code, 0, error)
+            self.assertIn("## CTA", output)
+            self.assertIn("已关联来源分析条目", output)
+            self.assertIn("HE0001", output)
+
+    def test_sotif_method_xlsx_sheets_follow_analysis_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            expected = {
+                "CTA": ["CTA-顶事件", "CTA-因果树", "CTA-底事件", "CTA-最小割集", "CTA-待确认"],
+                "STPA": ["STPA-损失与危害", "STPA-控制结构", "STPA-不安全控制行为", "STPA-原因场景", "STPA-安全约束", "STPA-待确认"],
+                "FMEA": ["FMEA", "FMEA-待确认"],
+            }
+            for task, sheets in expected.items():
+                path = Path(tmp) / f"{task.lower()}.xlsx"
+                code, output, error = self.invoke(f"分析高速 LCC，生成 {task}，输出 XLSX", "--backend", "template", "-o", str(path))
+                self.assertEqual(code, 0, error)
+                with ZipFile(path) as book:
+                    names = book.read("xl/workbook.xml").decode()
+                for name in sheets:
+                    self.assertIn(f'name="{name}"', names)
+                for other in ("CTA", "STPA", "FMEA"):
+                    if other != task:
+                        self.assertNotIn(f'name="{other}-', names)
 
 
 if __name__ == "__main__":

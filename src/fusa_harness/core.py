@@ -15,6 +15,8 @@ from pathlib import Path
 from zipfile import ZipFile
 
 from .safety import FSR_FIELDS, TSR_FIELDS, default_notes, describe, fsr_draft, tsr_draft
+from .sotif import SECTIONS as SOTIF_SECTIONS
+from .sotif import cut_sets_from_tree, fields_for as sotif_fields, sotif_draft
 
 
 FIELDS = {
@@ -23,9 +25,9 @@ FIELDS = {
         "Potential Effect", "Severity", "Severity Comment", "Exposure", "Exposure Comment",
         "Controllability", "Controllability Comment", "ASIL", "Safety Goal", "Safe State", "备注",
     ],
-    "FMEA": ["编号", "分析对象或接口", "功能", "失效模式", "失效原因", "局部影响", "整车影响", "是否可能形成危害", "现有控制", "安全措施"],
-    "CTA": ["编号", "顶层危险行为", "相关功能不足", "触发条件", "条件组合", "可能后果", "针对性措施"],
-    "STPA": ["编号", "控制结构", "控制动作", "不安全控制动作及其发生情境", "致因场景", "安全约束"],
+    "FMEA": sotif_fields("FMEA"),
+    "CTA": sotif_fields("CTA"),
+    "STPA": sotif_fields("STPA"),
     "TEST": ["编号", "对应分析编号", "测试目标", "场景与前置条件", "输入或故障注入", "执行步骤", "预期表现", "通过准则"],
     "FSR": FSR_FIELDS,
     "TSR": TSR_FIELDS,
@@ -275,6 +277,10 @@ def _row_number(row: dict) -> str:
         value = row.get(field)
         if value:
             return str(value)
+    # CTA/STPA 的分段表格用「节点编号」「UCA 编号」等字段标识行，统一按后缀识别。
+    for field, value in row.items():
+        if value and str(field).endswith("编号"):
+            return str(value)
     return ""
 
 
@@ -314,6 +320,29 @@ def read_analysis_ids(path: Path) -> list[str]:
 
 
 def schema_for(task: str) -> dict:
+    if task in {"CTA", "STPA"}:
+        section_schemas = []
+        for name, fields in SOTIF_SECTIONS[task]:
+            section_schemas.append({
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string", "enum": [name]},
+                    "rows": {"type": "array", "items": {
+                        "type": "object", "additionalProperties": False,
+                        "properties": {field: {"type": "string"} for field in fields},
+                        "required": fields,
+                    }},
+                },
+                "required": ["name", "rows"],
+            })
+        return {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "sections": {"type": "array", "items": {"anyOf": section_schemas}},
+                "notes": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["sections", "notes"],
+        }
     fields = FIELDS[task]
     properties = {name: {"type": "string"} for name in fields}
     if task == "HARA":
@@ -340,7 +369,7 @@ def schema_for(task: str) -> dict:
 
 def call_model(task: str, request: Request, references: list[Path], source_rows: list[dict], model: str) -> dict:
     source_ids = [_row_number(row) for row in source_rows]
-    minimum = HARA_MIN_ROWS if task == "HARA" else 6 if task in {"FSR", "TSR"} else 2
+    minimum = HARA_MIN_ROWS if task == "HARA" else 6 if task in {"FSR", "TSR"} else 8 if task in {"CTA", "STPA", "FMEA"} else 2
     if task == "HARA":
         framework = (
             "HARA 按 HARA Report 模板逐行输出：Hazard（[Hxxx] 编号与危害描述）、编号（HE 开头的唯一标识）、位置、道路条件、"
@@ -381,18 +410,62 @@ def call_model(task: str, request: Request, references: list[Path], source_rows:
             "接口、阈值与时间数值缺少依据处写“待确认”并说明需要补充的资料。"
         )
         source_hint = "来源分析条目（提供 FSR 时应逐条建立 FSR → TSR 追溯；提供 HARA 时应先推导候选 FSR）"
+    elif task == "CTA":
+        framework = (
+            "CTA 依据 ISO 21448:2022 第 7 章生成，按四个分段输出，分段名必须是："
+            "①「顶事件」：编号、顶事件（整车危害）、危害事件、相关功能、运行场景、危害后果、SOTIF 适用性、分析边界与假设；"
+            "②「因果树」：节点编号、父节点、节点类型（顶事件/中间事件/底事件）、逻辑门（AND/OR/—）、节点描述、不足类型、证据或假设；"
+            "③「底事件」：底事件编号、事件类别（功能定义不足/性能局限/触发条件/合理可预见误用）、事件描述、所属系统要素、"
+            "关联触发条件、导致的输出不足、是否属于 SOTIF 范围、处理措施、验证方式；"
+            "④「最小割集」：割集编号、阶数、布尔表达式、组成底事件、对应顶事件、SOTIF 处理优先级、说明、缓解与验证要点。"
+            "因果树必须同时出现 AND 与 OR 节点，最小割集由因果树推导（一阶优先）。"
+        )
+        rules = (
+            "CTA 是 SOTIF 演绎分析，只展开功能定义不足、性能局限、触发条件与合理可预见误用导致的因果链；"
+            "不得引入随机硬件失效、元器件失效或系统性软件缺陷（那属于 ISO 26262 FTA/FMEA）。"
+            "顶事件必须是整车层面的危害，不能写成“传感器不准”这类要素级问题。"
+            "未提供的架构信息按通用感知/决策/执行/人机分层补全，并在分析边界与假设中声明。"
+        )
+        source_hint = "来源分析条目（顶事件与危害事件应与来源危害保持一致）"
+    elif task == "STPA":
+        framework = (
+            "STPA 依据 MIT STPA Handbook 与 ISO 21448:2022 生成，按五个分段输出，分段名必须是："
+            "①「损失与危害」：编号、损失（Loss）、整车危害（Hazard）、危害事件、涉及利益相关者、初步安全约束；"
+            "②「控制结构」：层级、控制器或要素、控制动作（Control Action）、受控过程、反馈（Feedback）、接口与环境、边界假设；"
+            "③「不安全控制行为」：UCA 编号、控制器、控制动作、UCA 类型、不安全控制行为描述、关联整车危害、发生情境（最坏条件）、对应安全约束；"
+            "④「原因场景」：场景编号、关联 UCA、不足条件（IC）、因果因素（CF）、因素类型、说明与证据；"
+            "⑤「安全约束」：约束编号、关联 UCA、安全约束、约束类型、分配到要素、验证方式。"
+            "UCA 类型必须逐一覆盖四类：未提供、提供导致危害、时序错误、持续时间错误。"
+        )
+        rules = (
+            "UCA 必须写成“控制器 + 控制动作 + 类型 + 情境”的形式，并关联至少一个整车危害；每条 UCA 必须有对应安全约束。"
+            "原因场景按“不足条件（IC）→ 因果因素（CF）”展开，CF 类型只能是功能不足、输出不足或触发条件。"
+            "控制结构需包含驾驶员与 HMI 反馈，不得只画控制器到执行器的直线。"
+        )
+        source_hint = "来源分析条目（整车危害应覆盖来源危害，UCA 应能追溯到来源条目编号）"
+    elif task == "FMEA":
+        framework = (
+            "SOTIF 导向 FMEA 依据 ISO 21448:2022 生成，逐条输出：编号（F-001 起）、分析对象或功能、要素层级（功能/系统/硬件单元/软件单元）、"
+            "功能定义不足或性能局限、触发条件、输出不足、整车危害行为、危害事件、现有控制措施、SOTIF 措施、验证方式、残余风险说明。"
+            "每条必须构成完整链条：功能定义不足或性能局限 → 触发条件 → 输出不足 → 整车危害行为 → 危害事件 → 措施 → 验证方式。"
+        )
+        rules = (
+            "只分析 SOTIF 范畴的触发条件与性能局限，禁止把“摄像头在逆光下能力受限、雷达对静止目标信噪比不足”写成“硬件损坏/元器件失效”；"
+            "随机硬件失效属于 ISO 26262 FMEA，不得混入。措施应区分设计改进、限制运行条件与提示/培训三类，并给出可执行的验证方式。"
+        )
+        source_hint = "来源分析条目（危害事件可继承来源分析的危害与影响）"
     else:
         framework = "按各任务字段逐条写出实质内容。"
         rules = (
             "资料只支持其实际陈述的结构；不要猜测 ECU、传感器、接口名称。基于来源分析生成测试时保留对应编号。"
-            "HARA 必须逐条给出 S/E/C 评级理由，按真实危险事件审慎评级；FMEA 只分析随机硬件/系统故障链；"
-            "CTA 只分析预期功能不足与触发条件，不给 CTA 行赋 ASIL；STPA 使用控制动作和约束；测试用例需可执行、通过准则可观察。"
+            "HARA 必须逐条给出 S/E/C 评级理由，按真实危险事件审慎评级；测试用例需可执行、通过准则可观察。"
         )
         source_hint = "来源分析条目（测试用例应逐项对应其风险、原因与措施）"
     content: list[dict] = [{"type": "input_text", "text": (
         f"用户指令：{request.instruction}\n分析对象：{request.feature}\n只生成任务：{task}。\n"
         f"来源分析编号：{', '.join(source_ids) if source_ids else '无'}\n"
-        f"请用中文生成专业但可修改的初稿，至少 {minimum} 条具有不同情境的具体分析条目。所有字段写出实质内容。"
+        f"请用中文生成专业但可修改的初稿，至少 {minimum} 条具有不同情境的具体分析条目"
+        f"{'，并按分段组织为 sections' if task in {'CTA', 'STPA'} else ''}。所有字段写出实质内容。"
         f"{framework}"
         f"{rules}"
     )}]
@@ -485,7 +558,56 @@ def hara_rows(feature: str, instruction: str) -> list[dict]:
     return rows
 
 
+def _validate_sections(task: str, data: dict) -> list[dict]:
+    """CTA/STPA 按分析步骤分段校验，并保证分段名与字段与 ISO 分析步骤一致。"""
+    expected = dict(SOTIF_SECTIONS[task])
+    sections = data.get("sections")
+    if not isinstance(sections, list) or not sections:
+        raise ValueError(f"{task} 未生成分段结果（sections）。")
+    by_name: dict[str, list[dict]] = {}
+    for section in sections:
+        if not isinstance(section, dict):
+            raise ValueError(f"{task} 的分段格式无效。")
+        name = str(section.get("name") or "").strip()
+        rows = section.get("rows")
+        if name not in expected:
+            raise ValueError(f"{task} 出现未知分段：{name or '（空）'}；允许的分段为：{'、'.join(expected)}")
+        if not isinstance(rows, list) or not rows:
+            raise ValueError(f"{task} 分段「{name}」没有分析条目。")
+        for index, row in enumerate(rows, 1):
+            for field in expected[name]:
+                if not isinstance(row.get(field), str) or not row[field].strip():
+                    raise ValueError(f"{task} 分段「{name}」第 {index} 条缺少必填字段：{field}")
+        by_name[name] = rows
+    missing = [name for name in expected if name not in by_name]
+    if missing:
+        raise ValueError(f"{task} 缺少分段：{'、'.join(missing)}")
+    if task == "CTA":
+        # 最小割集必须由因果树推导，避免模型自说自话或与树不一致。
+        derived = cut_sets_from_tree(by_name["因果树"])
+        if not derived:
+            raise ValueError("CTA 的因果树未包含可推导的底事件。")
+        existing = by_name["最小割集"]
+        if {row["布尔表达式"] for row in existing} != {row["布尔表达式"] for row in derived}:
+            by_name["最小割集"] = derived
+    if task == "STPA":
+        kinds = " ".join(row["UCA 类型"] for row in by_name["不安全控制行为"])
+        missing_kinds = [kind for kind in ("未提供", "提供导致危害", "时序错误", "持续时间错误") if kind not in kinds]
+        if missing_kinds:
+            raise ValueError(f"STPA 未覆盖以下 UCA 类型：{'、'.join(missing_kinds)}")
+    ordered = [{"name": name, "fields": expected[name], "rows": by_name[name]} for name in expected]
+    data["sections"] = ordered
+    data["rows"] = by_name["底事件"] if task == "CTA" else by_name["不安全控制行为"]
+    notes = data.get("notes")
+    notes = [str(note).strip() for note in notes if str(note).strip()] if isinstance(notes, list) else []
+    data["notes"] = notes
+    return ordered
+
+
 def validate(task: str, data: dict, source_ids: list[str]) -> dict:
+    if task in {"CTA", "STPA"}:
+        _validate_sections(task, data)
+        return data
     if not isinstance(data, dict) or not isinstance(data.get("rows"), list) or not data["rows"]:
         raise ValueError(f"{task} 未生成分析条目。")
     fields = FIELDS[task]
@@ -524,37 +646,14 @@ def template(task: str, feature: str, instruction: str, source_rows: list[dict])
         return fsr_draft(feature, instruction, source_rows)
     if task == "TSR":
         return tsr_draft(feature, instruction, source_rows)
+    if task in {"CTA", "STPA", "FMEA"}:
+        return sotif_draft(task, feature, instruction, source_rows)
     lane = feature.upper() in {"LCC", "ALC", "LKA"}
     curve = "弯道" in instruction
     worn = "磨损" in instruction or "模糊" in instruction
     scenario = "高速公路弯道，车道线磨损" if curve and worn else "高速公路正常车道行驶"
-    steering = "横向控制" if lane else "功能控制"
-    event = "车辆偏离本车道，与相邻车辆或道路边界发生碰撞" if lane else "车辆未按预期执行功能，可能引发碰撞"
     if task == "HARA":
         rows = hara_rows(feature, instruction)
-    elif task == "FMEA":
-        rows = [
-            ["F-001", f"{feature} 横向控制命令接口（逻辑边界，待架构确认）", "向执行端提供期望控制命令", "命令卡滞或重复", "通信或计算故障（待架构确认）", "控制命令与当前场景不匹配", event, "是", "待确认：命令时效性与合理性监测", "增加超时、序列号及幅值合理性校验，异常时抑制控制并告警"],
-            ["F-002", f"{feature} 功能状态接口（逻辑边界，待架构确认）", "传递功能可用与激活状态", "状态错误或延迟", "状态更新故障（待架构确认）", "功能状态与实际控制不一致", "驾驶员可能误判控制状态，延迟接管", "是", "待确认：状态一致性监测", "状态不一致时退出功能并提示驾驶员"],
-        ]
-        if not lane:
-            rows[0][1] = f"{feature} 控制命令接口（逻辑边界，待架构确认）"
-    elif task == "CTA":
-        rows = ([
-            ["C-001", "车辆未保持安全横向轨迹", "车道边界识别置信度不足仍维持控制", "车道线磨损或低对比度", "弯道曲率增大 + 车道线磨损 + 驾驶员暂未接管", event, "识别置信度门限、曲率适用边界与退出提示联合设计"],
-            ["C-002", "车辆错误趋向相邻车道", "对道路边界的语义理解不足", "施工临时标线与旧标线并存", "临时标线冲突 + 高速行驶", event, "冲突标线检测、降低控制权限并提示接管"],
-        ] if lane else [
-            ["C-001", "功能输出与真实场景不匹配", "对运行场景适用性判断不足", "环境观测质量下降", "观测质量下降 + 功能仍激活 + 驾驶员暂未接管", event, "定义适用性置信度门限，超出边界时限制功能并提示接管"],
-            ["C-002", "功能在复杂场景中给出错误响应", "对场景语义的理解不足", "临时交通组织或异常目标", "场景语义冲突 + 高速行驶", event, "检测场景冲突，降低控制权限并提示接管"],
-        ])
-    elif task == "STPA":
-        rows = [
-            ["S-001", "驾驶员→功能控制器→横向执行端→车辆，环境感知反馈至控制器（抽象结构）", "发送横向控制命令", "车道边界不可靠时仍给出转向命令", "车道线磨损使边界估计偏移，控制器未及时降低权限", "SC-01：边界置信度不足时不得维持危险横向控制"],
-            ["S-002", "驾驶员→功能控制器→横向执行端→车辆，状态反馈至驾驶员（抽象结构）", "发出退出及接管提示", "控制能力下降时提示过晚", "状态评估延迟导致驾驶员可用接管时间不足", "SC-02：控制能力下降时及时退出并提供可感知接管提示"],
-        ]
-        if not lane:
-            rows[0] = ["S-001", "驾驶员→功能控制器→执行端→车辆，环境与车辆状态反馈至控制器（抽象结构）", "发送功能控制命令", "场景适用性不足时仍发送控制命令", "环境或目标理解偏差，控制器未及时降低权限", "SC-01：场景适用性不足时不得维持危险控制"]
-            rows[1][1] = "驾驶员→功能控制器→执行端→车辆，状态反馈至驾驶员（抽象结构）"
     else:
         if source_rows:
             rows = []
